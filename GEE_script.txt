@@ -1,0 +1,402 @@
+var box = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[-124.61227415198522, 42.001640558245334],
+          [-124.60187409936117, 36.815440789035094],
+          [-116.60382722436117, 36.815440789035094],
+          [-116.58185456811117, 41.9897097309874]]]),
+    us_counties = ee.FeatureCollection("users/campolojake/cb_2017_us_county_500k"),
+    fire_terra = ee.ImageCollection("MODIS/006/MOD14A1"),
+    fire_aqua = ee.ImageCollection("MODIS/006/MYD14A1"),
+    ls5 = ee.ImageCollection("LANDSAT/LT05/C01/T1_SR"),
+    lst_terra = ee.ImageCollection("MODIS/006/MOD11A1"),
+    lst_aqua = ee.ImageCollection("MODIS/006/MYD11A1"),
+    refl_terra = ee.ImageCollection("MODIS/006/MOD09GA"),
+    refl_aqua = ee.ImageCollection("MODIS/006/MYD09GA"),
+    chirps = ee.ImageCollection("UCSB-CHG/CHIRPS/DAILY"),
+    evapotrans = ee.ImageCollection("MODIS/006/MOD16A2"),
+    drought = ee.ImageCollection("IDAHO_EPSCOR/PDSI"),
+    gldas21 = ee.ImageCollection("NASA/GLDAS/V021/NOAH/G025/T3H"),
+    gldas2 = ee.ImageCollection("NASA/GLDAS/V20/NOAH/G025/T3H"),
+    lc = ee.ImageCollection("MODIS/006/MCD12Q1"),
+    geometry = /* color: #d63000 */ee.Geometry.Polygon(
+        [[[22.323669044198482, 9.026024175829907],
+          [22.345641700448482, 7.264265154758412],
+          [29.376891700448482, 7.373233341946634],
+          [29.245055762948482, 9.221276087181606]]]);
+
+/*
+  Collect climate and land surface reflectance variables for fire prediction project, CS229.
+*/
+
+// Isolate Northern California region of interest
+var cali = us_counties.filterMetadata("STATEFP", "equals", "06").union().geometry();
+var roi = cali.intersection(box);
+
+// Prepare inputs
+fire_terra = fire_terra.select("FireMask");
+fire_aqua = fire_aqua.select("FireMask");
+lst_aqua = lst_aqua.select("LST_Day_1km")
+lst_terra = lst_terra.select("LST_Day_1km")
+refl_aqua = refl_aqua.select([13,14,11,12,16,17], ["B", "G", "R", "NIR", "SWIR1", "SWIR2"])
+refl_terra = refl_terra.select([13,14,11,12,16,17], ["B", "G", "R", "NIR", "SWIR1", "SWIR2"])
+chirps = chirps.select(["precipitation"], ["precip"]);
+drought = drought.select([0], ["PDSI"])
+gldas2 = gldas2.select([5,24,26,27,25,35], 
+  ["ET", "SM_0_10", "SM_10_40", "SM_40_100", "SM_100_200", "WS"])
+gldas21 = gldas21.select([5,24,26,27,25,35], 
+  ["ET", "SM_0_10", "SM_10_40", "SM_40_100", "SM_100_200", "WS"])
+lc = lc.select(["LC_Type1"], ["LC"])
+
+var clim_years = ee.List.sequence(1985, 2005);
+var mod_clim_years = ee.List.sequence(2001, 2015)
+var lonlat = ee.Image.pixelLonLat().select([0,1], ["lon", "lat"])
+var fire_proj = refl_terra.select(11).first().projection()
+var mod_refl_scl = 463.3127165275
+var mod_lst_scl = 926.6254330555
+var chirps_scl = 5565.974539663679
+var drought_scl = 4638.312116386398
+var gldas_scl = 27829.87269831839
+
+// ----- General use functions -----
+function add_suffix(img, suffix) {
+  var old_names = img.bandNames();
+  var new_names = old_names.map(function(name) {
+    return ee.String(name).cat(suffix);
+  });
+  return img.select(old_names, new_names);
+}
+
+// ----- Functions to collect lag and climatology variables -----
+
+// MODIS reflectance, indices
+function index_prep(refl) {
+  refl = refl.multiply(0.0001)
+  var gcvi = refl.select(["NIR"], ["GCVI"]).divide(refl.select("G")).subtract(1)
+  var ndvi = refl.normalizedDifference(["NIR", "R"]).select([0], ["NDVI"])
+  var ndmi = refl.normalizedDifference(["NIR", "SWIR1"]).select([0], ["NDMI"])
+  var ndwi = refl.normalizedDifference(["G", "NIR"]).select([0], ["NDWI"])
+  var nbr1 = refl.normalizedDifference(["NIR", "SWIR2"]).select([0], ["NBR1"])
+  var nbr2 = refl.normalizedDifference(["SWIR1", "SWIR2"]).select([0], ["NBR2"])
+  var tcg = refl.multiply(ee.Image([-0.1603, -0.2819, -0.4934, 0.7940, 0.0002, -0.1446]))
+    .reduce(ee.Reducer.sum()).select([0], ["TCG"])
+  var tcw = refl.multiply(ee.Image([0.0315, 0.2021, 0.3102, 0.1594, 0.6806, -0.6109]))
+    .reduce(ee.Reducer.sum()).select([0], ["TCW"])
+  
+  return ee.Image([refl, gcvi, ndvi, ndmi, ndwi, nbr1, nbr2, tcg, tcw]).float()
+}
+
+function mod_refl_y(dt) {
+  var pre_aqua = dt.difference(ee.Date("2002-10-04"), "day").lt(0)
+  
+  var refl_1w_lag_terra = refl_terra.filterDate(dt.advance(-1, "week"), dt).mean()
+  var refl_1w_lag = ee.Image(ee.Algorithms.If(pre_aqua, refl_1w_lag_terra, 
+    refl_aqua.filterDate(dt.advance(-1, "week"), dt).mean().add(refl_1w_lag_terra).divide(2)))
+  var mod_1w_lag = add_suffix(index_prep(refl_1w_lag), "_1w")
+  
+  var refl_1m_lag_terra = refl_terra.filterDate(dt.advance(-1, "month"), dt).mean()
+  var refl_1m_lag = ee.Image(ee.Algorithms.If(pre_aqua, refl_1m_lag_terra, 
+    refl_aqua.filterDate(dt.advance(-1, "month"), dt).mean().add(refl_1m_lag_terra).divide(2)))
+  var mod_1m_lag = add_suffix(index_prep(refl_1m_lag), "_1m")
+  
+  var refl_3m_lag_terra = refl_terra.filterDate(dt.advance(-3, "month"), dt).mean()
+  var refl_3m_lag = ee.Image(ee.Algorithms.If(pre_aqua, refl_3m_lag_terra, 
+    refl_aqua.filterDate(dt.advance(-3, "month"), dt).mean().add(refl_3m_lag_terra).divide(2)))
+  var mod_3m_lag = add_suffix(index_prep(refl_3m_lag), "_3m")
+  
+  return ee.Image([mod_1w_lag, mod_1m_lag, mod_3m_lag])
+}
+
+function refl_clim(dt) {
+  function ymap(y) {
+    var ydate = dt.update({year: y})
+    return mod_refl_y(ydate)
+  }
+  var clim = add_suffix(ee.ImageCollection(mod_clim_years.map(ymap)).mean(), "_clim")
+  return clim
+}
+
+function get_refl(dt) {
+  return mod_refl_y(dt)//.addBands(refl_clim(dt))
+  // return refl_clim(dt)
+}
+
+// MODIS LST
+function mod_lst_y(dt) {
+  var pre_aqua = dt.difference(ee.Date("2002-10-04"), "day").lt(0)
+  
+  var lst_1w_lag_terra = lst_terra.filterDate(dt.advance(-1, "week"), dt).mean()
+  var lst_1w_lag = ee.Image(ee.Algorithms.If(pre_aqua, lst_1w_lag_terra, 
+    lst_aqua.filterDate(dt.advance(-1, "week"), dt).mean().add(lst_1w_lag_terra).divide(2)))
+  var mod_1w_lag = add_suffix(lst_1w_lag, "_1w")
+  
+  var lst_1m_lag_terra = lst_terra.filterDate(dt.advance(-1, "month"), dt).mean()
+  var lst_1m_lag = ee.Image(ee.Algorithms.If(pre_aqua, lst_1m_lag_terra, 
+    lst_aqua.filterDate(dt.advance(-1, "month"), dt).mean().add(lst_1m_lag_terra).divide(2)))
+  var mod_1m_lag = add_suffix(lst_1m_lag, "_1m")
+
+  var lst_3m_lag_terra = lst_terra.filterDate(dt.advance(-3, "month"), dt).mean()
+  var lst_3m_lag = ee.Image(ee.Algorithms.If(pre_aqua, lst_3m_lag_terra, 
+    lst_aqua.filterDate(dt.advance(-3, "month"), dt).mean().add(lst_3m_lag_terra).divide(2)))
+  var mod_3m_lag = add_suffix(lst_3m_lag, "_3m")
+  
+  return ee.Image([mod_1w_lag, mod_1m_lag, mod_3m_lag]).multiply(0.02)
+}
+
+function lst_clim(dt) {
+  function ymap(y) {
+    var ydate = dt.update({year: y})
+    return mod_lst_y(ydate)
+  }
+  var clim = add_suffix(ee.ImageCollection(mod_clim_years.map(ymap)).mean(), "_clim")
+  return clim
+}
+
+function get_lst(dt) {
+  return mod_lst_y(dt)//.addBands(lst_clim(dt))
+}
+
+// CHIRPS precipitation
+function precip_y(dt) {
+  var p_1d_lag = add_suffix(chirps.filterDate(dt.advance(-1, "day"), dt).sum(), "_1d")
+  var p_1w_lag = add_suffix(chirps.filterDate(dt.advance(-1, "week"), dt).sum(), "_1w")
+  var p_1m_lag = add_suffix(chirps.filterDate(dt.advance(-1, "month"), dt).sum(), "_1m")
+  var p_3m_lag = add_suffix(chirps.filterDate(dt.advance(-3, "month"), dt).sum(), "_3m")
+  return ee.Image([p_1d_lag, p_1w_lag, p_1m_lag, p_3m_lag])
+}
+
+function precip_clim(dt) {
+  function ymap(y) {
+    var ydate = dt.update({year: y});
+    return precip_y(ydate)
+  }
+  var clim = add_suffix(ee.ImageCollection(clim_years.map(ymap)).mean(), "_clim")
+  return clim
+}
+
+function get_precip(dt) {
+  return precip_y(dt).addBands(precip_clim(dt))
+}
+
+// U Idaho Drought
+function drought_y(dt) {
+  var d_1m_lag = add_suffix(drought.filterDate(dt.advance(-1, "month"), dt).mean(), "_1m")
+  var d_3m_lag = add_suffix(drought.filterDate(dt.advance(-3, "month"), dt).mean(), "_3m")
+  return ee.Image([d_1m_lag, d_3m_lag])
+}
+
+function drought_clim(dt) {
+  function ymap(y) {
+    var ydate = dt.update({year: y});
+    return drought_y(ydate)
+  }
+  var clim = add_suffix(ee.ImageCollection(clim_years.map(ymap)).mean(), "_clim")
+  return clim
+}
+
+function get_drought(dt) {
+  return drought_y(dt).addBands(drought_clim(dt))
+}
+
+// GLDAS Evapotranspiration, Soil moisture, wind speed
+function gldas_y(dt, coll) {
+  var g_1d_lag = add_suffix(coll.filterDate(dt.advance(-1, "day"), dt).mean(), "_1d")
+  var g_1w_lag = add_suffix(coll.filterDate(dt.advance(-1, "week"), dt).mean(), "_1w")
+  var g_1m_lag = add_suffix(coll.filterDate(dt.advance(-1, "month"), dt).mean(), "_1m")
+  var g_3m_lag = add_suffix(coll.filterDate(dt.advance(-3, "month"), dt).mean(), "_3m")
+  return ee.Image([g_1d_lag, g_1w_lag, g_1m_lag, g_3m_lag])
+}
+
+function gldas_clim(dt) {
+  function ymap(y) {
+    var ydate = dt.update({year: y});
+    return gldas_y(ydate, gldas2)
+  }
+  var clim = add_suffix(ee.ImageCollection(clim_years.map(ymap)).mean(), "_clim")
+  return clim  
+}
+
+function get_gldas(dt) {
+  return gldas_y(dt, gldas21).addBands(gldas_clim(dt))
+}
+
+// Main function: iteratively sample fire / non-fire pixels
+function fire_sample(ft_img) {
+  // var ft_img = ee.Image(fire_terra.filterDate("2002-01-01", "2003-01-01").first())
+  var seed = ee.Number(ft_img.get("system:time_start")).divide(86400000).int16()
+  var dt = ee.Date(ft_img.get("system:time_start"))
+  var dt_img = ee.Image([dt.get("year"), dt.getRelative("day", "year").add(1)])
+    .select([0,1], ["year", "doy"])
+
+  // Fire
+  var fa = fire_aqua.filterDate(dt)
+  var fa_img = ee.Image(ee.Algorithms.If(fa.size().eq(0), ee.Image(-1), fa.first()))
+  var fire_img = ft_img.addBands(fa_img).reduce(ee.Reducer.max()).gte(7).select([0], ["fire"])
+  var fire_only = fire_img.updateMask(fire_img)
+  var no_fire = fire_img.updateMask(fire_img.not())
+
+  // Predictors
+  
+  var lc_y = ee.Image(lc.filterDate(dt.update({day: 1, month:1})).first())
+
+  // Generate points
+  var fire_pts = fire_only.sample({region: roi, scale: mod_refl_scl, geometries: true})
+  var fire_pts_cnt = fire_pts.size()
+  var no_fire_pts = no_fire.sample({region: roi, scale: mod_refl_scl, 
+    numPixels: fire_pts_cnt, seed: seed, geometries: true})
+  var pts = fire_pts.merge(no_fire_pts)
+  
+  // Sample
+  pts = ee.Image([get_refl(dt), lc_y, dt_img, lonlat])
+    .sampleRegions({collection: pts, scale: mod_lst_scl, geometries: true})
+  pts = ee.Image([get_lst(dt)])
+    .sampleRegions({collection: pts, scale: mod_lst_scl, geometries: true})
+  pts = ee.Image([get_precip(dt)])
+    .sampleRegions({collection: pts, scale: chirps_scl, geometries: true})
+  pts = ee.Image([get_drought(dt)])
+    .sampleRegions({collection: pts, scale: drought_scl, geometries: true})
+  pts = ee.Image([get_gldas(dt)])
+    .sampleRegions({collection: pts, scale: gldas_scl})
+  
+  return pts
+}
+
+/*
+var name = "all"
+for (var y = 2015; y <= 2017 ; y++) {
+  var base = ee.Date.fromYMD(y, 1, 1)
+  var fire_q1_1_1 = fire_terra.filterDate(base, base.advance(15, "day"))
+  var fire_q1_1_2 = fire_terra.filterDate(base.advance(15, "day"), base.advance(1, "month"))
+  var fire_q1_1_3 = fire_terra.filterDate(base.advance(1, "month"), base.advance(45, "day"))
+  var fire_q1_2_1 = fire_terra.filterDate(base.advance(45, "day"), base.advance(2, "month"))
+  var fire_q1_2_2 = fire_terra.filterDate(base.advance(2, "month"), base.advance(75, "day"))
+  var fire_q1_2_3 = fire_terra.filterDate(base.advance(75, "day"), base.advance(3, "month"))
+  var fire_q2_1_1 = fire_terra.filterDate(base.advance(3, "month"), base.advance(105, "day"))
+  var fire_q2_1_2 = fire_terra.filterDate(base.advance(105, "day"), base.advance(4, "month"))
+  var fire_q2_1_3 = fire_terra.filterDate(base.advance(4, "month"), base.advance(135, "day"))
+  var fire_q2_2_1 = fire_terra.filterDate(base.advance(135, "day"), base.advance(5, "month"))
+  var fire_q2_2_2 = fire_terra.filterDate(base.advance(5, "month"), base.advance(165, "day"))
+  var fire_q2_2_3 = fire_terra.filterDate(base.advance(165, "day"), base.advance(6, "month"))
+  var fire_q3_1_1 = fire_terra.filterDate(base.advance(6, "month"), base.advance(195, "day"))
+  var fire_q3_1_2 = fire_terra.filterDate(base.advance(195, "day"), base.advance(7, "month"))
+  var fire_q3_1_3 = fire_terra.filterDate(base.advance(7, "month"), base.advance(225, "day"))
+  var fire_q3_2_1 = fire_terra.filterDate(base.advance(225, "day"), base.advance(8, "month"))
+  var fire_q3_2_2 = fire_terra.filterDate(base.advance(8, "month"), base.advance(255, "day"))
+  var fire_q3_2_3 = fire_terra.filterDate(base.advance(255, "day"), base.advance(9, "month"))
+  var fire_q4_1_1 = fire_terra.filterDate(base.advance(9, "month"), base.advance(285, "day"))
+  var fire_q4_1_2 = fire_terra.filterDate(base.advance(285, "day"), base.advance(10, "month"))
+  var fire_q4_1_3 = fire_terra.filterDate(base.advance(10, "month"), base.advance(315, "day"))
+  var fire_q4_2_1 = fire_terra.filterDate(base.advance(315, "day"), base.advance(11, "month"))
+  var fire_q4_2_2 = fire_terra.filterDate(base.advance(11, "month"), base.advance(345, "day"))
+  var fire_q4_2_3 = fire_terra.filterDate(base.advance(345, "day"), base.advance(12, "month"))
+  
+  Export.table.toDrive(ee.FeatureCollection(fire_q1_1_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q1_1_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q1_1_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q1_1_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q1_1_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q1_1_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q1_2_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q1_2_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q1_2_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q1_2_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q1_2_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q1_2_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q2_1_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q2_1_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q2_1_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q2_1_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q2_1_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q2_1_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q2_2_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q2_2_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q2_2_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q2_2_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q2_2_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q2_2_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q3_1_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q3_1_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q3_1_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q3_1_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q3_1_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q3_1_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q3_2_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q3_2_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q3_2_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q3_2_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q3_2_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q3_2_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q4_1_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q4_1_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q4_1_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q4_1_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q4_1_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q4_1_3", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q4_2_1.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q4_2_1", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q4_2_2.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q4_2_2", "CS 229a")
+  Export.table.toDrive(ee.FeatureCollection(fire_q4_2_3.map(fire_sample)).flatten(),
+    "fire_"+name+"_"+y+"_q4_2_3", "CS 229a")
+  
+}
+*/
+
+// Visualization
+/*
+,Estimate,Std. Error,z value,Pr(>|z|)
+(Intercept),-0.188967474,0.015067308,-12.54155487,4.42E-36
+LC2,-0.556103957,0.030428299,-18.27588043,1.29E-74
+LC4,-0.022823909,0.248175224,-0.091966914,0.926724327
+LC5,-0.383538657,0.093028456,-4.122810097,3.74E-05
+LC6,0.496399119,0.031343701,15.83728478,1.72E-56
+LC7,0.129349804,0.044825223,2.885647764,0.003906091
+LC8,0.065629419,0.011856907,5.535121492,3.11E-08
+LC9,0.071313085,0.01453948,4.904789382,9.35E-07
+LC10,0.014117213,0.014205771,0.993766091,0.320336758
+LC11,-1.080205467,0.097861881,-11.03806154,2.50E-28
+LC12,1.990288168,0.014121637,140.9389158,0
+LC13,0.087999031,0.026479247,3.323320713,0.000889526
+LC14,2.285239968,0.056129982,40.71335632,0
+LC15,-8.889650078,22.23091295,-0.399877868,0.689246474
+LC16,-2.497960817,0.082529057,-30.26765247,3.06E-201
+LC17,-3.177667827,0.118555221,-26.8032719,2.96E-158
+GCVI_1w,-0.31422523,0.003153218,-99.65224886,0
+SWIR2_3m,-8.377311983,0.119130174,-70.32065616,0
+ET_1w,20625.89249,269.0392521,76.6649934,0
+*/
+
+var lc_2017 = ee.Image(lc.filterDate(ee.Date.fromYMD(2017,1,1)).first())
+
+function fire_prob(dt) {
+  dt = ee.Date(dt)
+  
+  // Compile covariates
+  var refl = get_refl(dt)
+  var gcvi_1w = refl.select("GCVI_1w")
+  var swir2_3m = refl.select("SWIR2_3m")
+  var et_1w = gldas_y(dt, gldas21).select("ET_1w")
+  
+  // Apply coefficients
+  var z = lc_2017.remap(
+      [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17],
+      [0,-0.556103957,-0.022823909,-0.022823909,-0.383538657,0.496399119,
+       0.129349804, 0.065629419, 0.071313085, 0.014117213, -1.080205467, 1.990288168,
+       0.087999031, 2.285239968, -8.889650078, -2.497960817, -3.177667827])
+    .add(gcvi_1w.multiply(-0.31422523))
+    .add(swir2_3m.multiply(-8.377311983))
+    .add(et_1w.multiply(20625.89249))
+    .add(-0.188967474)
+    
+  // Sigmoid
+  var g_z = z.multiply(-1).exp().add(1).pow(-1)
+  
+  return g_z
+}
+
+var summer2017 = ee.List.sequence(1496275200000, 1504137600000, 86400000)
+var risk = ee.ImageCollection(summer2017.map(fire_prob))
+var risk_mean = risk.mean().clip(roi)
+Map.addLayer(risk_mean, {palette: ["FFFF66", "FFCC00", "FF9900", "FF0000"], max: 0.65})
+
+// Feature image
+Map.addLayer(get_refl(ee.Date("2018-07-15")).select("GCVI_1w").clip(roi), 
+  {min: 0, max: 6, palette: ["003300", "00ff00"]})
